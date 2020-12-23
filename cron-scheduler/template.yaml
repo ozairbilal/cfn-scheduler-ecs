@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This Template create resources to schedule the scaling of resources time based"
+
+Parameters:
+  varLambdaScalingFunction:
+    Type: "String"
+    Default: "scaleResourcesOnSchedule"
+  varS3KeyCode:
+    Type: String
+    Description: Target destination for the code in the S3 bucket
+    Default: "UNDEFINED"
+  varLambdaRate:
+    Description: The rate (frequency) that determines when CloudWatch Events.
+    # Schedule is on the basis of UTC timezone UAE is 7, 20 hours
+    Default: cron(0 3,16 * * ? *)
+    AllowedValues:
+      - cron(0 3,16 * * ? *)
+    Type: String
+  varDeploymentEnv:
+    Description: Enter either prod or non-prod
+    Type: String
+    AllowedValues:
+      - prod
+      - non-prod
+Conditions:
+  IsNonProdEnvironment:  !Equals [!Ref varDeploymentEnv, "non-prod"]
+Resources:
+
+  lambdaIAMRole:
+    Condition: IsNonProdEnvironment
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "logs:*"
+                Effect: "Allow"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${varLambdaScalingFunction}:*"
+          PolicyName: "lambdaScalingLogs"
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "ecs:DescribeServices"
+                  - "ecs:UpdateService"
+                  - "ecs:ListServices"
+                  - "ecs:ListClusters"
+                  - "ecs:DescribeClusters"
+                Effect: "Allow"
+                Resource: '*'
+          PolicyName: "lambdaScaleECSLogs"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  LambdaCronScalingFunction:
+    Condition: IsNonProdEnvironment
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        S3Bucket: !ImportValue s3-CFS3Bucket
+        S3Key: !Ref 'varS3KeyCode'
+      Description: "Lambda Function to scale all ecs resources on schedule"
+      FunctionName: !Ref "varLambdaScalingFunction"
+      Environment:
+        Variables:
+          securityGroup: !ImportValue ec2-WhitelistSecurityGroup
+      Handler: "scheduler.handler"
+      MemorySize: 128
+      Role: !GetAtt "lambdaIAMRole.Arn"
+      Runtime: "nodejs12.x"
+      Timeout: 10
+
+  LambdaSchedule:
+    Condition: IsNonProdEnvironment
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref varLambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaCronScalingFunction.Arn}
+          Id: LambdaSchedule
+
+  LambdaSchedulePermission:
+    Condition: IsNonProdEnvironment
+    Type: "AWS::Lambda::Permission"
+    DependsOn:
+      - LambdaCronScalingFunction
+      - LambdaSchedule
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaCronScalingFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaSchedule.Arn}
+
+  lambdaScalingLogGroup:
+    Condition: IsNonProdEnvironment
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${varLambdaScalingFunction}"
+      RetentionInDays: 90
+
+Outputs:
+  LambdaCronScalingFunction:
+    Value: !Ref LambdaCronScalingFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaCronScalingFunction"
